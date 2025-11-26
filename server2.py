@@ -560,4 +560,68 @@ async def run_aggregated_query(
         try:
             match_stage.update(json.loads(filter_json.replace("'", '"')))
         except Exception as e:
-        
+            return response_error(f"Invalid filter_json: {e}", 400)
+
+    if carrier:
+        match_stage["flightLegState.carrier"] = carrier
+
+    def _has_time_component(s: str) -> bool:
+        if not s:
+            return False
+        return ("T" in s) or (":" in s)
+
+    def _norm_date_only(s: str) -> str:
+        if not s:
+            return s
+        parsed = validate_date(s)
+        return parsed or s
+    if start_date or end_date:
+        if _has_time_component(start_date or "") or _has_time_component(end_date or ""):
+            dt_field = "flightLegState.operation.actualTimes.takeoffTime"
+            start = (start_date or "")
+            end = (end_date or "")
+            match_stage[dt_field] = {"$gte": start, "$lte": end}
+        else:
+            start = _norm_date_only(start_date) if start_date else None
+            end = _norm_date_only(end_date) if end_date else None
+            rng = {}
+            if start:
+                rng["$gte"] = start
+            if end:
+                rng["$lte"] = end
+            if rng:
+                match_stage["flightLegState.dateOfOrigin"] = rng
+
+    if not match_stage and query_type != "count":
+        return response_error("Refusing to run aggregation without filters. Provide filter_json, carrier, or date range.", 400)
+
+    agg_map = {
+        "average": {"$avg": f"${field}"},
+        "sum": {"$sum": f"${field}"},
+        "min": {"$min": f"${field}"},
+        "max": {"$max": f"${field}"},
+        "count": {"$count": 1},
+    }
+    if query_type not in agg_map:
+        return response_error(f"Unsupported query_type '{query_type}'. Use one of: average, sum, min, max, count", 400)
+
+    try:
+        logger.info(f"Running aggregation type={query_type} match={match_stage} field={field}")
+
+        if query_type == "count":
+            count = await col.count_documents(match_stage)
+            return response_ok({"pipeline": "count_documents", "results": [{"value": count}]})
+
+        pipeline = [{"$match": match_stage}, {"$group": {"_id": None, "value": agg_map[query_type]}}]
+        docs = await col.aggregate(pipeline).to_list(length=10)
+        return response_ok({"pipeline": pipeline, "results": docs})
+    except Exception as e:
+        logger.exception("Aggregation query failed")
+        return response_error(f"Aggregation failed: {str(e)}", 500)
+
+
+# --- Run MCP Server ---
+if __name__ == "__main__":
+    logger.info("Starting FlightOps MCP Server on %s:%s (transport=%s)", HOST, PORT, TRANSPORT)
+    logger.info("MongoDB URL: %s, Database: %s, Collection: %s", MONGODB_URL, DATABASE_NAME, COLLECTION_NAME)
+    mcp.run(transport="streamable-http")
